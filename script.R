@@ -1,17 +1,17 @@
 #### settings ####
 
 ## set wait period
-wait_time_in_seconds = 60
+wait_time_in_seconds = 10
 
-## set maximum error count
-max_error_count = 10
+## set maximum error count per url
+max_per_url_test_attempts = 3
 
 
 
-#### mobile-friendliness tests in bulk ####
+#### perform mobile-friendliness tests in bulk ####
 
-## import api key
-source('api_key.R')
+## import api keys
+source('api_keys.R')
 
 ## set service URL
 service_url = 'https://searchconsole.googleapis.com/v1/urlTestingTools/mobileFriendlyTest:run'
@@ -19,83 +19,151 @@ service_url = 'https://searchconsole.googleapis.com/v1/urlTestingTools/mobileFri
 ## import libraries
 library(glue)
 library(httr)
-library(lubridate)
-library(tidyverse)
+
 
 ## import spreadsheet
-input_df = read.csv("urls.csv", stringsAsFactors=FALSE)
+urls_df = read.csv("urls.csv", stringsAsFactors=FALSE)
 
-## separate into those with and without URLs
-urls_df = subset(input_df, !grepl('no website', url))
-no_urls_df = subset(input_df, grepl('no website', url))
+## remove completely blank rows
+urls_df = urls_df[rowSums(is.na(urls_df)) != ncol(urls_df),]
 
+## lowercase urls
+urls_df$url <- tolower(urls_df$url)
+
+## remove "no website" rows
+urls_df = subset(urls_df, !grepl('no website', urls_df$url))
 
 ## prepend www to urls if not in place
-urls_df$url = ifelse(!grepl('www\\.', urls_df$url),
+urls_df$url = ifelse(!grepl('no website', urls_df$url) & !grepl('www\\.', urls_df$url),
                      paste0('www.', urls_df$url),
                      urls_df$url)
 
 ## prepend http:// to urls if not in place
-urls_df$url = ifelse(!grepl('http://|https://', urls_df$url),
+urls_df$url = ifelse(!grepl('no website', urls_df$url) & !grepl('http://|https://', urls_df$url),
                      paste0('http://', urls_df$url),
                      urls_df$url)
 
-## place N/A when there are no urls
-no_urls_df$testStatus = no_urls_df$mobileFriendliness = 'N/A'
+## calculate number of urls to test
+n_urls = nrow(urls_df)
 
-## initialize error counter
-error_count = 0
+## initialize total query count
+total_query_count = 0
 
-## as long as there is an unperformed mobile-friendliness test
-while (NA %in% urls_df$testStatus & error_count < max_error_count) {
-  
-  ## calculate the total number of urls to test
-  n_cases = sum(is.na(urls_df$testStatus))
-  
+## for each url
+for (i in 1:n_urls) {
+
   ## get url to test
-  url = urls_df$url[is.na(urls_df$testStatus)][1]
-  
-  ## get index of selected url's placement in the df
-  n = which(urls_df$url==url)
-  
+  url = urls_df$url[i]
+
   ## print to console to show progress
-  print(glue('Performing mobile-friendly test for: {url} ({n_cases} remaining)'))    
+  print(glue('Performing mobile-friendliness test for {url} ({i} out of {n_urls})'))   
+
+  ## initialize number of url test attempts
+  n_url_test_attempts = 0
   
-  ## make post request to service URL
-  r = POST(service_url, query = list(url=url, key=api_key))  
-  
-  ## save response content
-  response_content = content(r)
-  
-  ## if test was completed 
-  if (!is.null(response_content$testStatus$status)) {
-    urls_df[n, 'testStatus'] = response_content$testStatus$status
-    urls_df[n, 'mobileFriendliness'] = ifelse(response_content$testStatus$status=='COMPLETE', 
-                                              response_content$mobileFriendliness, NA)
+  ## before the test is completed and before we reach the per-url attempt limit
+  while (n_url_test_attempts < max_per_url_test_attempts) {
+    
+    ## increment total query count
+    total_query_count = total_query_count + 1
+    
+    ## increment test attempt count
+    n_url_test_attempts = n_url_test_attempts + 1
+    
+    ## get api key to use
+    api_key_index = (total_query_count - 1) %% length(api_keys) + 1
+    api_key = api_keys[api_key_index]
+    
+    ## print to console to show progress
+    print(glue('Attempt #{n_url_test_attempts}, using API key {api_key}'))
+    
+    ## make post request to service URL
+    r = POST(service_url, query = list(url=url, key=api_key))  
+      
+    ## save response content
+    response_content = content(r)        
+      
+    ## if test was completed 
+    if (!is.null(response_content$testStatus$status)) {
+        urls_df[i, 'testStatus'] = response_content$testStatus$status
+        urls_df[i, 'mobileFriendliness'] = ifelse(response_content$testStatus$status=='COMPLETE', 
+                                                  response_content$mobileFriendliness, NA)
+        
+        ## break out of the while loop to stop testing the current url
+        break
+    }
+    
+    ## if there was a known error
+    else if (!is.null(response_content$error)) {
+
+      ## print the error message
+      print(response_content$error$message)
+      
+      ## if program should make more test attempts      
+      if (n_url_test_attempts < max_per_url_test_attempts) {
+
+        ## wait before trying again
+        Sys.sleep(wait_time_in_seconds) 
+      }
+      
+      ## if this is the final attempt
+      else {
+        
+        ## log the error in output df
+        urls_df[i, 'testStatus'] <- response_content$error$message
+        urls_df[i, 'mobileFriendliness'] <- response_content$error$message
+        
+        ## break out of the while loop to stop testing the current url
+        break
+      }
+    } 
+    
+    ## if there was an unknown error
+    else {
+      
+      ## print the error message
+      print(glue('Unknown error encountered while testing {url}'))
+      
+      ## if program should make more test attempts      
+      if (n_url_test_attempts < max_per_url_test_attempts) {
+        
+        ## wait before trying again
+        Sys.sleep(wait_time_in_seconds) 
+      }
+      
+      ## if this is the final attempt
+      else {
+        
+        ## log the error in output df
+        urls_df[i, 'testStatus'] <- 'UNKNOWN_ERROR_ENCOUNTERED'
+        urls_df[i, 'mobileFriendliness'] <- 'UNKNOWN_ERROR_ENCOUNTERED'
+        
+        ## break out of the while loop to stop testing the current url
+        break
+      }
+      
+    }
+
   } 
+
+  ## print to console to delimit progress
+  print(glue('---------------------------'))
   
-  ## if there was an issue
-  else {
-    Sys.sleep(wait_time_in_seconds) # wait before resuming 
-  }
-  
-  ## if this was the last test
-  if (n_cases==1) {
+  ## if this was the last url to test
+  if (i==n_urls) {
     
     ## print completion message
     print(glue("Tests complete."))
-    break
   }
   
   ## if there are more tests to perform
   else {
-    Sys.sleep(wait_time_in_seconds) # wait before resuming
+    
+    ## wait before moving onto the next url
+    Sys.sleep(wait_time_in_seconds) 
   }
+  
 }
 
-## create output df
-output_df = rbind.data.frame(urls_df, no_urls_df)
-
 ## export the test result in csv
-write.csv(output_df, "urls.csv", row.names=FALSE)
-
+write.csv(urls_df, "urls.csv", row.names=FALSE)
